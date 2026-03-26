@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import streamlit as st
 
-from app.services.session_state import get_rag_service, init_state
-from app.utils.file_utils import save_uploaded_files
+from services.session_state import get_rag_service, init_state
+from utils.file_utils import save_uploaded_files
 
 
 def render_document_tab() -> None:

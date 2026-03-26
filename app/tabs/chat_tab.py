@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from app.services.session_state import get_rag_service, init_state
+from services.session_state import get_rag_service, init_state
 
 
 def render_chat_tab() -> None:

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from app.services.rag_service import RAGService
+from services.rag_service import RAGService
 
 
 def get_rag_service() -> RAGService:

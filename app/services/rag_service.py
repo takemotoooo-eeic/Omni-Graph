@@ -213,9 +213,23 @@ class RAGService:
         }
 
     def query(self, text: str, mode: str = "hybrid") -> str:
-        self.ensure_initialized()
+        self._ensure_lightrag_ready()
         assert self.rag is not None
         return asyncio.run(self.rag.aquery(text, mode=mode))
+
+    def _ensure_lightrag_ready(self) -> None:
+        self.ensure_initialized()
+        assert self.rag is not None
+
+        initializer = getattr(self.rag, "_ensure_lightrag_initialized", None)
+        if not callable(initializer):
+            return
+
+        result = asyncio.run(initializer())
+        if isinstance(result, dict) and not result.get("success", True):
+            raise RuntimeError(
+                result.get("error", "LightRAG の初期化に失敗しました。")
+            )
 
     def get_graph_data(self) -> dict[str, list[dict[str, Any]]]:
         self.ensure_initialized()

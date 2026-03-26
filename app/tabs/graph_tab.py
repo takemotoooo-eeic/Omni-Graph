@@ -1,30 +1,94 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
 
 import streamlit as st
+import streamlit.components.v1 as components
 
-from app.services.session_state import get_rag_service, init_state
+from services.session_state import get_rag_service, init_state
 
 
-def _to_dot(nodes: list[dict], edges: list[dict]) -> str:
-    lines = ["digraph G {", 'rankdir="LR";', 'node [shape=ellipse, style=filled, fillcolor="#E8F0FE"];']
+def _build_vis_network_html(nodes: list[dict], edges: list[dict], height: int = 640) -> str:
+    vis_nodes = []
+    for node in nodes:
+        node_id = str(node["id"])
+        vis_nodes.append(
+            {
+                "id": node_id,
+                "label": str(node.get("label", node_id)),
+                "title": f"id: {node_id}\ntype: {node.get('type', 'entity')}",
+            }
+        )
 
-    node_ids = {n["id"] for n in nodes}
-    for n in nodes:
-        safe_label = str(n.get("label", n["id"])).replace('"', "'")
-        lines.append(f'"{n["id"]}" [label="{safe_label}"];')
+    vis_edges = []
+    for edge in edges:
+        vis_edges.append(
+            {
+                "from": str(edge["source"]),
+                "to": str(edge["target"]),
+                "label": str(edge.get("relation", "related_to")),
+                "arrows": "to",
+                "smooth": {"enabled": True, "type": "dynamic"},
+            }
+        )
 
-    for e in edges:
-        if e["source"] not in node_ids:
-            lines.append(f'"{e["source"]}" [label="{e["source"]}"];')
-        if e["target"] not in node_ids:
-            lines.append(f'"{e["target"]}" [label="{e["target"]}"];')
-        rel = str(e.get("relation", "related_to")).replace('"', "'")
-        lines.append(f'"{e["source"]}" -> "{e["target"]}" [label="{rel}"];')
+    nodes_json = json.dumps(vis_nodes, ensure_ascii=False)
+    edges_json = json.dumps(vis_edges, ensure_ascii=False)
 
-    lines.append("}")
-    return "\n".join(lines)
+    return f"""
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style>
+      #kg {{
+        width: 100%;
+        height: {height}px;
+        border: 1px solid #E5E7EB;
+        border-radius: 10px;
+        background: #FFFFFF;
+      }}
+    </style>
+  </head>
+  <body>
+    <div id="kg"></div>
+    <script>
+      const nodes = new vis.DataSet({nodes_json});
+      const edges = new vis.DataSet({edges_json});
+      const container = document.getElementById("kg");
+      const data = {{ nodes, edges }};
+      const options = {{
+        autoResize: true,
+        interaction: {{
+          dragNodes: true,
+          dragView: true,
+          zoomView: true,
+          hover: true,
+          navigationButtons: true,
+          keyboard: true
+        }},
+        physics: {{
+          enabled: true,
+          stabilization: {{ iterations: 200 }}
+        }},
+        nodes: {{
+          shape: "dot",
+          size: 14,
+          font: {{ size: 14 }},
+          borderWidth: 1
+        }},
+        edges: {{
+          font: {{ align: "middle", size: 10 }},
+          color: {{ inherit: false, color: "#94A3B8" }}
+        }}
+      }};
+      new vis.Network(container, data, options);
+    </script>
+  </body>
+</html>
+"""
 
 
 def render_graph_tab() -> None:
@@ -51,7 +115,8 @@ def render_graph_tab() -> None:
 
     col1, col2 = st.columns([2, 1])
     with col1:
-        st.graphviz_chart(_to_dot(nodes, edges), use_container_width=True)
+        st.caption("マウスホイールでズーム、ドラッグで移動、ノードのドラッグで配置調整できます。")
+        components.html(_build_vis_network_html(nodes, edges), height=680, scrolling=False)
     with col2:
         st.metric("ノード数", len(nodes))
         st.metric("エッジ数", len(edges))

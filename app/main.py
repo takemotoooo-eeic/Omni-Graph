@@ -1,17 +1,17 @@
 import streamlit as st
 
-from app.tabs.chat_tab import render_chat_tab
-from app.tabs.document_tab import render_document_tab
-from app.tabs.graph_tab import render_graph_tab
+from tabs.chat_tab import render_chat_tab
+from tabs.document_tab import render_document_tab
+from tabs.graph_tab import render_graph_tab
 
 
 def _init_page() -> None:
     st.set_page_config(
-        page_title="RAGAnything Knowledge Graph App",
+        page_title="OmniGraph App",
         page_icon="🧠",
         layout="wide",
     )
-    st.title("RAGAnything Knowledge Graph App")
+    st.title("OmniGraph App")
     st.caption("ドキュメント取り込み -> 知識グラフ可視化 -> グラフQAチャット")
 
 

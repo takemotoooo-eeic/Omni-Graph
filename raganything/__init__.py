@@ -1,5 +1,7 @@
 from .raganything import RAGAnything as RAGAnything
 from .config import RAGAnythingConfig as RAGAnythingConfig
+OmniGraph = RAGAnything
+OmniGraphConfig = RAGAnythingConfig
 
 # Core parser class is always available.
 from .parser import Parser as Parser
@@ -61,11 +63,13 @@ __version__ = "1.2.9"
 __author__ = "Zirui Guo"
 __url__ = "https://github.com/HKUDS/RAG-Anything"
 
-__all__ = ["RAGAnything", "RAGAnythingConfig"]
+__all__ = ["RAGAnything", "RAGAnythingConfig", "OmniGraph", "OmniGraphConfig"]
 
 __all__ = [
     "RAGAnything",
     "RAGAnythingConfig",
+    "OmniGraph",
+    "OmniGraphConfig",
     "Parser",
 ]
 

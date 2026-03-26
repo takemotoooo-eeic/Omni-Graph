@@ -81,7 +81,7 @@ extras_require = {
 }
 
 setuptools.setup(
-    name="raganything",
+    name="omnigraph",
     url=metadata["__url__"],
     version=metadata["__version__"],
     author=metadata["__author__"],
