@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 from google import genai
 from google.genai import types
-from lightrag.utils import EmbeddingFunc
+from lightrag.utils import EmbeddingFunc, always_get_an_event_loop
 from raganything import RAGAnything, RAGAnythingConfig
 
 
@@ -22,6 +22,16 @@ class RAGService:
         self.output_dir = output_dir
         self.parser = parser
         self.rag: RAGAnything | None = None
+
+    def _run_async(self, awaitable: Any) -> Any:
+        """
+        Run an awaitable on the shared event loop.
+
+        LightRAG/ nano-vectordb uses asyncio primitives (e.g. Lock) that must
+        be accessed from the same event loop that created them.
+        """
+        loop = always_get_an_event_loop()
+        return loop.run_until_complete(awaitable)
 
     def ensure_initialized(self) -> None:
         if self.rag is not None:
@@ -193,7 +203,7 @@ class RAGService:
 
         for file_path in file_paths:
             try:
-                asyncio.run(
+                self._run_async(
                     self.rag.process_document_complete(
                         file_path=file_path,
                         output_dir=self.output_dir,
@@ -215,7 +225,22 @@ class RAGService:
     def query(self, text: str, mode: str = "hybrid") -> str:
         self._ensure_lightrag_ready()
         assert self.rag is not None
-        return asyncio.run(self.rag.aquery(text, mode=mode))
+        return self._run_async(self.rag.aquery(text, mode=mode))
+
+    def query_with_context(self, text: str, mode: str = "hybrid") -> dict[str, Any]:
+        """
+        return_context=True で取得したコンテキスト（nodes/edges/images）も含めて返す
+        """
+        self._ensure_lightrag_ready()
+        assert self.rag is not None
+        result = self._run_async(self.rag.aquery(text, mode=mode, return_context=True))
+        if not isinstance(result, dict):
+            return {"return": str(result), "nodes": [], "edges": [], "images": []}
+        # 期待キーが無ければ補完
+        result.setdefault("nodes", [])
+        result.setdefault("edges", [])
+        result.setdefault("images", [])
+        return result
 
     def _ensure_lightrag_ready(self) -> None:
         self.ensure_initialized()
@@ -225,7 +250,7 @@ class RAGService:
         if not callable(initializer):
             return
 
-        result = asyncio.run(initializer())
+        result = self._run_async(initializer())
         if isinstance(result, dict) and not result.get("success", True):
             raise RuntimeError(
                 result.get("error", "LightRAG の初期化に失敗しました。")
@@ -261,7 +286,10 @@ class RAGService:
             if not callable(method):
                 continue
             try:
-                result = asyncio.run(method()) if inspect.iscoroutinefunction(method) else method()
+                if inspect.iscoroutinefunction(method):
+                    result = self._run_async(method())
+                else:
+                    result = method()
                 normalized = self._normalize_graph_payload(result)
                 if normalized["nodes"] or normalized["edges"]:
                     return normalized
@@ -352,16 +380,49 @@ class RAGService:
         nodes: list[dict[str, Any]] = []
         edges: list[dict[str, Any]] = []
 
+        # GraphMLの <key id="d0" attr.name="entity_id" ...> を参照して、
+        # <data key="d0">value</data> を属性名に展開する。
+        key_map: dict[str, dict[str, str]] = {}
+        for key in root.findall(".//g:key", ns):
+            key_id = key.attrib.get("id", "")
+            if not key_id:
+                continue
+            key_map[key_id] = {
+                "attr.name": key.attrib.get("attr.name", key_id),
+                "for": key.attrib.get("for", ""),
+                "attr.type": key.attrib.get("attr.type", ""),
+            }
+
+        def _parse_container_data(container: ET.Element) -> dict[str, Any]:
+            attributes: dict[str, Any] = {}
+            for data in container.findall("g:data", ns):
+                k = data.attrib.get("key", "")
+                if not k:
+                    continue
+                attr_name = key_map.get(k, {}).get("attr.name", k) or k
+                attributes[attr_name] = data.text or ""
+            return attributes
+
         for node in root.findall(".//g:node", ns):
             node_id = node.attrib.get("id", "")
             if not node_id:
                 continue
+
+            attributes = _parse_container_data(node)
+            # <node> の属性（通常は id だけ）も残しておく
+            for k, v in node.attrib.items():
+                if k == "id":
+                    continue
+                attributes[k] = v
+
+            label = attributes.get("entity_id") or node_id
+            node_type = attributes.get("entity_type") or "entity"
             nodes.append(
                 {
                     "id": node_id,
-                    "label": node_id,
-                    "type": "entity",
-                    "attributes": dict(node.attrib),
+                    "label": str(label),
+                    "type": str(node_type),
+                    "attributes": attributes,
                 }
             )
 
@@ -370,12 +431,25 @@ class RAGService:
             target = edge.attrib.get("target", "")
             if not source or not target:
                 continue
+
+            attributes = _parse_container_data(edge)
+            for k, v in edge.attrib.items():
+                if k in ("source", "target"):
+                    continue
+                attributes[k] = v
+
+            # edgeには label が無いことがあるため、まず属性側から探す
+            relation = (
+                attributes.get("relation")
+                or edge.attrib.get("label")
+                or "related_to"
+            )
             edges.append(
                 {
                     "source": source,
                     "target": target,
-                    "relation": edge.attrib.get("label", "related_to"),
-                    "attributes": dict(edge.attrib),
+                    "relation": str(relation),
+                    "attributes": attributes,
                 }
             )
 

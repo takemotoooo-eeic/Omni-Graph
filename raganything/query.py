@@ -100,7 +100,7 @@ class QueryMixin:
 
     async def aquery(
         self, query: str, mode: str = "mix", system_prompt: str | None = None, **kwargs
-    ) -> str:
+    ) -> Any:
         """
         Pure text query - directly calls LightRAG's query functionality
 
@@ -147,6 +147,11 @@ class QueryMixin:
                 "VLM enhanced query requested but vision_model_func is not available, falling back to normal query"
             )
 
+        return_context: bool = bool(kwargs.get("return_context", False))
+        if return_context:
+            # return_contextはlightrag側のQueryParamに無いので誤渡しを防ぐ
+            kwargs.pop("return_context", None)
+
         callback_manager = getattr(self, "callback_manager", None)
         query_start_time = time.time()
 
@@ -189,7 +194,59 @@ class QueryMixin:
                 duration_seconds=duration,
                 result_length=result_len,
             )
-        return result
+
+        if not return_context:
+            return result
+
+        # return_context=True: nodes/edges も一緒に返す（VLM画像は無いので空）
+        context_param = QueryParam(mode=mode, **kwargs)
+        context_result = await self.lightrag.aquery_data(query, param=context_param)
+        context_nodes: List[Dict[str, Any]] = []
+        context_edges: List[Dict[str, Any]] = []
+        if isinstance(context_result, dict):
+            data = context_result.get("data") or {}
+            entities = data.get("entities") or []
+            relationships = data.get("relationships") or []
+
+            if isinstance(entities, list):
+                for ent in entities:
+                    if not isinstance(ent, dict):
+                        continue
+                    ent_name = ent.get("entity_name")
+                    if not ent_name:
+                        continue
+                    context_nodes.append(
+                        {
+                            "id": str(ent_name),
+                            "label": str(ent_name),
+                            "type": str(ent.get("entity_type") or "entity"),
+                            "attributes": ent,
+                        }
+                    )
+
+            if isinstance(relationships, list):
+                for rel in relationships:
+                    if not isinstance(rel, dict):
+                        continue
+                    src = rel.get("src_id") or rel.get("source")
+                    tgt = rel.get("tgt_id") or rel.get("target")
+                    if not src or not tgt:
+                        continue
+                    context_edges.append(
+                        {
+                            "source": str(src),
+                            "target": str(tgt),
+                            "relation": str(rel.get("description") or "related_to"),
+                            "attributes": rel,
+                        }
+                    )
+
+        return {
+            "return": result,
+            "nodes": context_nodes,
+            "edges": context_edges,
+            "images": [],
+        }
 
     async def aquery_with_multimodal(
         self,
@@ -338,7 +395,7 @@ class QueryMixin:
         system_prompt: str | None = None,
         extra_safe_dirs: List[str] = None,
         **kwargs,
-    ) -> str:
+    ) -> Any:
         """
         VLM enhanced query - replaces image paths in retrieved context with base64 encoded images for VLM processing
 
@@ -368,11 +425,84 @@ class QueryMixin:
         if hasattr(self, "_current_images_base64"):
             delattr(self, "_current_images_base64")
 
+        # return_context は lightrag側の QueryParam に存在しないため、
+        # raganything側で解釈して pop しておく（QueryParam に誤渡しない）
+        return_context: bool = bool(kwargs.pop("return_context", False))
+
+        # return_context=True の場合は、nodes/edges を確実に返すために
+        # LightRAGの構造化取得 API（aquery_data）から取得する
+        context_nodes: List[Dict[str, Any]] = []
+        context_edges: List[Dict[str, Any]] = []
+        if return_context:
+            context_param = QueryParam(mode=mode, **kwargs)
+            context_result = await self.lightrag.aquery_data(
+                query, param=context_param
+            )
+            if isinstance(context_result, dict):
+                data = context_result.get("data") or {}
+                entities = data.get("entities") or []
+                relationships = data.get("relationships") or []
+
+                if isinstance(entities, list):
+                    for ent in entities:
+                        if not isinstance(ent, dict):
+                            continue
+                        ent_name = ent.get("entity_name")
+                        if not ent_name:
+                            continue
+                        context_nodes.append(
+                            {
+                                "id": str(ent_name),
+                                "label": str(ent_name),
+                                "type": str(ent.get("entity_type") or "entity"),
+                                "attributes": ent,
+                            }
+                        )
+
+                if isinstance(relationships, list):
+                    for rel in relationships:
+                        if not isinstance(rel, dict):
+                            continue
+                        src = rel.get("src_id") or rel.get("source")
+                        tgt = rel.get("tgt_id") or rel.get("target")
+                        if not src or not tgt:
+                            continue
+                        context_edges.append(
+                            {
+                                "source": str(src),
+                                "target": str(tgt),
+                                "relation": str(rel.get("description") or "related_to"),
+                                "attributes": rel,
+                            }
+                        )
+
         # 1. Get original retrieval prompt (without generating final answer)
         query_param = QueryParam(mode=mode, only_need_prompt=True, **kwargs)
-        raw_prompt = await self.lightrag.aquery(query, param=query_param)
+        raw_prompt_result = await self.lightrag.aquery(query, param=query_param)
 
         self.logger.debug("Retrieved raw prompt from LightRAG")
+
+        def _extract_prompt_text(obj: Any) -> str:
+            if isinstance(obj, str):
+                return obj
+            if isinstance(obj, dict):
+                # LightRAG側のキー名は実装依存なので、候補を幅広く吸収する
+                for key in (
+                    "prompt",
+                    "only_need_prompt",
+                    "context_prompt",
+                    "raw_prompt",
+                    "return",
+                    "result",
+                ):
+                    v = obj.get(key)
+                    if isinstance(v, str) and v.strip():
+                        return v
+                # dictでもprompt文字列が無い場合は空にしておく
+                return ""
+            return str(obj or "")
+
+        raw_prompt = _extract_prompt_text(raw_prompt_result)
 
         # 2. Extract and process image paths
         enhanced_prompt, images_found = await self._process_image_paths_for_vlm(
@@ -383,9 +513,17 @@ class QueryMixin:
             self.logger.info("No valid images found, falling back to normal query")
             # Fallback to normal query
             query_param = QueryParam(mode=mode, **kwargs)
-            return await self.lightrag.aquery(
+            fallback_result = await self.lightrag.aquery(
                 query, param=query_param, system_prompt=system_prompt
             )
+            if not return_context:
+                return fallback_result
+            return {
+                "return": fallback_result,
+                "nodes": context_nodes,
+                "edges": context_edges,
+                "images": [],
+            }
 
         self.logger.info(f"Processed {images_found} images for VLM")
 
@@ -398,7 +536,17 @@ class QueryMixin:
         result = await self._call_vlm_with_multimodal_content(messages)
 
         self.logger.info("VLM enhanced query completed")
-        return result
+        if not return_context:
+            return result
+
+        # return_context=True: nodes/edges に加え、VLM処理に使った画像パスも返す
+        image_paths: List[str] = getattr(self, "_current_images_paths", [])
+        return {
+            "return": result,
+            "nodes": context_nodes,
+            "edges": context_edges,
+            "images": image_paths,
+        }
 
     async def _process_multimodal_query_content(
         self, base_query: str, multimodal_content: List[Dict[str, Any]]
@@ -584,7 +732,8 @@ class QueryMixin:
         images_processed = 0
 
         # Initialize image cache
-        self._current_images_base64 = []
+        self._current_images_base64: List[str] = []
+        self._current_images_paths: List[str] = []
 
         # Enhanced regex pattern for matching image paths
         # Matches only the path ending with image file extensions
@@ -664,6 +813,8 @@ class QueryMixin:
                     images_processed += 1
                     # Save base64 to instance variable for later use
                     self._current_images_base64.append(image_base64)
+                    # Keep original path (not base64) for return_context use
+                    self._current_images_paths.append(image_path)
 
                     # Keep original path info and add VLM marker
                     result = f"Image Path: {image_path}\n[VLM_IMAGE_{images_processed}]"

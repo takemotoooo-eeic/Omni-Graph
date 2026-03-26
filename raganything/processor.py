@@ -8,6 +8,7 @@ import os
 import time
 import hashlib
 import json
+from collections import Counter
 from typing import Dict, List, Any, Tuple, Optional
 from pathlib import Path
 
@@ -21,10 +22,293 @@ from raganything.utils import (
 )
 import asyncio
 from lightrag.utils import compute_mdhash_id
+import xml.etree.ElementTree as ET
 
 
 class ProcessorMixin:
     """ProcessorMixin class containing document processing functionality for RAGAnything"""
+
+    def _normalize_source_id_to_chunk_ids(self, source_id: Any) -> List[str]:
+        """Normalize LightRAG source_id field into chunk-id list."""
+        if not source_id:
+            return []
+
+        if isinstance(source_id, list):
+            return [str(x).strip() for x in source_id if str(x).strip()]
+
+        if not isinstance(source_id, str):
+            return [str(source_id).strip()] if str(source_id).strip() else []
+
+        normalized = source_id
+        for sep in ["<SEP>", "||", ",", "\t", "\n"]:
+            normalized = normalized.replace(sep, "|")
+
+        return [part.strip() for part in normalized.split("|") if part.strip()]
+
+    async def _infer_chunk_source_type(self, chunk_id: str) -> str:
+        """
+        Infer source type from chunk payload.
+        Defaults to `text` for standard textual chunks.
+        """
+        try:
+            chunk_data = await self.lightrag.text_chunks.get_by_id(chunk_id)
+            if not chunk_data:
+                return "unknown"
+            if chunk_data.get("is_multimodal"):
+                return str(chunk_data.get("original_type", "multimodal"))
+            return "text"
+        except Exception:
+            return "unknown"
+
+    def _graphml_add_or_get_key(
+        self,
+        root,
+        key_id: str,
+        for_attr: str,
+        attr_name: str,
+        attr_type: str = "string",
+    ):
+        """
+        Ensure GraphML header has a <key> entry for the given node attribute.
+        """
+        ns_uri = "http://graphml.graphdrawing.org/xmlns"
+        ns = {"g": ns_uri}
+        existing = root.findall("g:key", ns)
+        for k in existing:
+            if k.attrib.get("id") == key_id:
+                return
+        root.insert(
+            1,
+            ET.Element(
+                f"{{{ns_uri}}}key",
+                {
+                    "id": key_id,
+                    "for": for_attr,
+                    "attr.name": attr_name,
+                    "attr.type": attr_type,
+                },
+            ),
+        )
+        return key_id
+
+    def _graphml_get_key_id_by_attr_name(self, root, attr_name: str, for_attr: str = "node"):
+        """Find existing GraphML key id by attr.name."""
+        for key in root.findall(".//{*}key"):
+            if (
+                key.attrib.get("for") == for_attr
+                and key.attrib.get("attr.name") == attr_name
+            ):
+                return key.attrib.get("id")
+        return None
+
+    async def _annotate_entity_nodes_with_source_types(self, doc_id: str):
+        """
+        Add source-type metadata (text/image/table/...) to KG nodes for a document.
+        """
+        if not doc_id:
+            return
+
+        if not getattr(self.lightrag, "full_entities", None):
+            return
+
+        doc_entities = await self.lightrag.full_entities.get_by_id(doc_id)
+        if not doc_entities:
+            return
+
+        entity_names = doc_entities.get("entity_names", [])
+        if not entity_names:
+            return
+
+        annotated = 0
+        entity_source_types_map: Dict[str, Dict[str, Any]] = {}
+        for entity_name in entity_names:
+            try:
+                entity_id = compute_mdhash_id(entity_name, prefix="ent-")
+                entity_data = await self.lightrag.entities_vdb.get_by_id(entity_id)
+                if not entity_data:
+                    continue
+
+                chunk_ids = self._normalize_source_id_to_chunk_ids(
+                    entity_data.get("source_id")
+                )
+                if not chunk_ids:
+                    continue
+
+                source_types = []
+                for chunk_id in chunk_ids:
+                    source_types.append(await self._infer_chunk_source_type(chunk_id))
+
+                source_types = [t for t in source_types if t]
+                if not source_types:
+                    continue
+
+                type_counter = Counter(source_types)
+                primary_source_type = type_counter.most_common(1)[0][0]
+
+                node_data = {
+                    "entity_id": entity_name,
+                    "source_types": sorted(set(source_types)),
+                    "primary_source_type": primary_source_type,
+                    "source_id": entity_data.get("source_id", ""),
+                    "file_path": entity_data.get("file_path", ""),
+                    "updated_at": int(time.time()),
+                }
+                await self.lightrag.chunk_entity_relation_graph.upsert_node(
+                    entity_name, node_data
+                )
+                annotated += 1
+                entity_source_types_map[entity_name] = {
+                    "source_types": node_data["source_types"],
+                    "primary_source_type": node_data["primary_source_type"],
+                }
+            except Exception as e:
+                self.logger.debug(
+                    f"Failed to annotate source types for entity {entity_name}: {e}"
+                )
+
+        if annotated:
+            self.logger.info(
+                f"Annotated source types on {annotated} knowledge graph nodes for doc {doc_id}"
+            )
+            try:
+                await self._inject_source_types_into_graphml(
+                    entity_source_types_map
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to inject source_types into graphml for doc {doc_id}: {e}"
+                )
+
+    async def _inject_source_types_into_graphml(
+        self,
+        entity_source_types_map: Dict[str, Dict[str, Any]],
+    ):
+        """
+        Post-process graphml file to include source_types attributes.
+
+        LightRAG's GraphML exporter seems to write only a fixed set of node keys.
+        So we patch the existing graphml file to add new node attributes.
+        """
+        graphml_path = Path(self.config.working_dir) / "graph_chunk_entity_relation.graphml"
+        if not graphml_path.exists():
+            self.logger.debug(f"GraphML not found: {graphml_path}")
+            return
+
+        tree = ET.parse(graphml_path)
+        root = tree.getroot()
+
+        # Namespace handling
+        ns_uri = "http://graphml.graphdrawing.org/xmlns"
+        ET.register_namespace("", ns_uri)
+
+        # Find next available node key ids (d0..dN)
+        existing_key_ids = set()
+        for key in root.findall(".//{*}key"):
+            kid = key.attrib.get("id", "")
+            if kid.startswith("d") and kid[1:].isdigit():
+                existing_key_ids.add(kid)
+        def next_key_id():
+            i = 0
+            while True:
+                candidate = f"d{i}"
+                if candidate not in existing_key_ids:
+                    return candidate
+                i += 1
+
+        source_types_key_id = self._graphml_get_key_id_by_attr_name(
+            root, "source_types", "node"
+        )
+        if source_types_key_id is None:
+            source_types_key_id = next_key_id()
+            existing_key_ids.add(source_types_key_id)
+            self._graphml_add_or_get_key(
+                root, source_types_key_id, "node", "source_types"
+            )
+
+        primary_source_type_key_id = self._graphml_get_key_id_by_attr_name(
+            root, "primary_source_type", "node"
+        )
+        if primary_source_type_key_id is None:
+            primary_source_type_key_id = next_key_id()
+            existing_key_ids.add(primary_source_type_key_id)
+            self._graphml_add_or_get_key(
+                root, primary_source_type_key_id, "node", "primary_source_type"
+            )
+
+        source_id_key_id = self._graphml_get_key_id_by_attr_name(root, "source_id", "node")
+
+        nodes_updated = 0
+        for node in root.findall(".//{*}node"):
+            node_id = node.attrib.get("id", "")
+            if not node_id:
+                continue
+
+            attrs = entity_source_types_map.get(node_id)
+
+            # Fallback: infer from node's source_id directly so every node can be annotated.
+            if attrs is None and source_id_key_id is not None:
+                node_source_id = ""
+                for data in node.findall(".//{*}data"):
+                    if data.attrib.get("key") == source_id_key_id:
+                        node_source_id = data.text or ""
+                        break
+                chunk_ids = self._normalize_source_id_to_chunk_ids(node_source_id)
+                if chunk_ids:
+                    source_types = []
+                    for chunk_id in chunk_ids:
+                        source_types.append(await self._infer_chunk_source_type(chunk_id))
+                    source_types = [t for t in source_types if t and t != "unknown"]
+                    if source_types:
+                        type_counter = Counter(source_types)
+                        attrs = {
+                            "source_types": sorted(set(source_types)),
+                            "primary_source_type": type_counter.most_common(1)[0][0],
+                        }
+
+            if attrs is None:
+                continue
+
+            source_types_val = attrs.get("source_types", [])
+            if isinstance(source_types_val, list):
+                source_types_val = ",".join([str(x) for x in source_types_val])
+            else:
+                source_types_val = str(source_types_val)
+            primary_source_type_val = attrs.get("primary_source_type", "unknown")
+            primary_source_type_val = str(primary_source_type_val)
+
+            # Add/replace data entries for the new keys
+            found_source_types = False
+            found_primary_source_type = False
+            for data in node.findall(".//{*}data"):
+                if data.attrib.get("key") == source_types_key_id:
+                    data.text = source_types_val
+                    found_source_types = True
+                if data.attrib.get("key") == primary_source_type_key_id:
+                    data.text = primary_source_type_val
+                    found_primary_source_type = True
+
+            if not found_source_types:
+                node.append(
+                    ET.Element(
+                        f"{{{ns_uri}}}data",
+                        {"key": source_types_key_id},
+                    )
+                )
+                node[-1].text = source_types_val
+            if not found_primary_source_type:
+                node.append(
+                    ET.Element(
+                        f"{{{ns_uri}}}data",
+                        {"key": primary_source_type_key_id},
+                    )
+                )
+                node[-1].text = primary_source_type_val
+            nodes_updated += 1
+
+        tree.write(graphml_path, encoding="utf-8", xml_declaration=True)
+        self.logger.info(
+            f"Injected source_types into graphml for {nodes_updated} nodes: {graphml_path}"
+        )
 
     def _get_file_reference(self, file_path: str) -> str:
         """
@@ -1630,6 +1914,12 @@ class ProcessorMixin:
             raise
 
         self.logger.info(f"Document {file_path} processing complete!")
+        try:
+            await self._annotate_entity_nodes_with_source_types(doc_id)
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to annotate source types for document {doc_id}: {e}"
+            )
         if callback_manager is not None:
             duration = time.time() - doc_start_time
             callback_manager.dispatch(
@@ -1812,6 +2102,13 @@ class ProcessorMixin:
                     split_by_character_only=split_by_character_only,
                     ids=doc_id,
                     scheme_name=scheme_name,
+                )
+
+            try:
+                await self._annotate_entity_nodes_with_source_types(doc_id)
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to annotate source types for document {doc_id}: {e}"
                 )
 
             self.logger.info(f"Document {file_path} processing completed successfully")

@@ -1011,6 +1011,45 @@ class MineruParser(Parser):
 
             base_output_dir.mkdir(parents=True, exist_ok=True)
 
+            # Determine effective method for compatibility.
+            # Note: MinerU 2.7.0+ may create backend-dependent subfolders.
+            backend = kwargs.get("backend") or ""
+            effective_method = method
+            if backend.startswith("vlm-"):
+                effective_method = "vlm"
+            elif backend.startswith("hybrid-"):
+                effective_method = "hybrid_auto"
+
+            # If MinerU output already exists, skip re-running mineru.
+            # We detect by presence of the expected *_content_list.json.
+            name_without_suff = pdf_path.stem
+            direct_json = base_output_dir / f"{name_without_suff}_content_list.json"
+            file_stem_subdir = base_output_dir / name_without_suff
+
+            mineru_json_exists = direct_json.exists()
+            if not mineru_json_exists and file_stem_subdir.is_dir():
+                for subdir in file_stem_subdir.iterdir():
+                    if not subdir.is_dir():
+                        continue
+                    candidate_json = subdir / f"{name_without_suff}_content_list.json"
+                    if candidate_json.exists():
+                        mineru_json_exists = True
+                        break
+
+            if not mineru_json_exists:
+                fallback_json = (
+                    file_stem_subdir / effective_method / f"{name_without_suff}_content_list.json"
+                )
+                mineru_json_exists = fallback_json.exists()
+
+            if mineru_json_exists:
+                content_list, _ = self._read_output_files(
+                    base_output_dir,
+                    name_without_suff,
+                    method=effective_method,
+                )
+                return content_list
+
             # Run mineru command
             self._run_mineru_command(
                 input_path=pdf_path,
@@ -1029,14 +1068,8 @@ class MineruParser(Parser):
             # Note: _read_output_files() will scan subdirectories automatically,
             # so this mapping is just for optimization and fallback
             # Use `or ""` to handle both missing keys and explicit None values
-            backend = kwargs.get("backend") or ""
-            if backend.startswith("vlm-"):
-                method = "vlm"
-            elif backend.startswith("hybrid-"):
-                method = "hybrid_auto"
-
             content_list, _ = self._read_output_files(
-                base_output_dir, name_without_suff, method=method
+                base_output_dir, name_without_suff, method=effective_method
             )
             return content_list
 
