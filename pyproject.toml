@@ -24,7 +24,7 @@ dependencies = [
     "huggingface_hub",
     "lightrag-hku",
     "mineru[core]",
-    "streamlit>=1.55.0",
+    "streamlit>=1.65.0",
     "tqdm",
 ]
 
